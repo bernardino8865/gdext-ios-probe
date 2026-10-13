@@ -1,7 +1,7 @@
-﻿name: GDExtension iOS probe
+name: GDExtension iOS probe
 
 # Prova (ou derruba) que uma GDExtension C++ (godot-cpp) empacotada em .xcframework exporta e compila para iOS com Godot 4.7.1.
-# Roda a cada push e pelo botao "Run workflow".
+# v2: projeto de teste PROPRIO (probe_project) na forma do jogo real; nome da biblioteca por versao do godot-cpp.
 
 on:
   push:
@@ -21,8 +21,12 @@ jobs:
         include:
           - rotulo: godot-cpp-4.5-stable
             ref: e83fd0904c13356ed1d4c3d09f8bb9132bdc6b77
+            lib: libgdexample
+            entry: example_library_init
           - rotulo: godot-cpp-10.0.0-stable
             ref: 507ed9d840c01a3c5b2a39af8bb4000bfac30bf5
+            lib: libmytest
+            entry: my_test_library_init
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +36,6 @@ jobs:
           git clone https://github.com/godotengine/godot-cpp.git godot-cpp
           git -C godot-cpp checkout ${{ matrix.ref }}
           git -C godot-cpp log -1 --format='godot-cpp em %H (%cd)'
-          ls godot-cpp/test godot-cpp/test/project
 
       - name: Instalar SCons
         run: |
@@ -44,14 +47,29 @@ jobs:
         working-directory: godot-cpp/test
         run: |
           set -o pipefail
+          {
           for T in template_debug template_release; do
-            scons arch=universal ios_simulator=yes platform=ios target=$T 2>&1 | tail -n 15
-            scons arch=arm64 ios_simulator=no platform=ios target=$T 2>&1 | tail -n 15
-            ls -la project/bin ../bin || true
-            xcodebuild -create-xcframework -library ./project/bin/libmytest.ios.$T.a -library ./project/bin/libmytest.ios.$T.simulator.a -output ./project/bin/libmytest.ios.$T.xcframework
+            scons arch=universal ios_simulator=yes platform=ios target=$T 2>&1 | tail -n 5
+            scons arch=arm64 ios_simulator=no platform=ios target=$T 2>&1 | tail -n 5
+            ls -la project/bin ../bin
+            xcodebuild -create-xcframework -library ./project/bin/${{ matrix.lib }}.ios.$T.a -library ./project/bin/${{ matrix.lib }}.ios.$T.simulator.a -output ./project/bin/${{ matrix.lib }}.ios.$T.xcframework
             xcodebuild -create-xcframework -library ../bin/libgodot-cpp.ios.$T.arm64.a -library ../bin/libgodot-cpp.ios.$T.universal.simulator.a -output ./project/bin/libgodot-cpp.ios.$T.xcframework
-          done 2>&1 | tee ../../build_cpp.log
+          done
           ls -la project/bin
+          } 2>&1 | tee ../../build_cpp.log
+
+      - name: Montar o projeto de teste proprio (forma do jogo real)
+        run: |
+          set -euo pipefail
+          mkdir -p probe_project/bin
+          cp -R godot-cpp/test/project/bin/${{ matrix.lib }}.ios.template_debug.xcframework   probe_project/bin/
+          cp -R godot-cpp/test/project/bin/${{ matrix.lib }}.ios.template_release.xcframework probe_project/bin/
+          cp -R godot-cpp/test/project/bin/libgodot-cpp.ios.template_debug.xcframework        probe_project/bin/
+          cp -R godot-cpp/test/project/bin/libgodot-cpp.ios.template_release.xcframework      probe_project/bin/
+          sed -e 's|@ENTRY@|${{ matrix.entry }}|' -e 's|@LIB@|${{ matrix.lib }}|' probe_project/probe.gdextension.in > probe_project/probe.gdextension
+          cat probe_project/probe.gdextension
+          ls -la probe_project probe_project/bin
+          echo "--- export_presets.cfg"; cat probe_project/export_presets.cfg
 
       - name: Instalar Godot 4.7.1 (padrao, sem mono) e os templates de export
         run: |
@@ -68,28 +86,17 @@ jobs:
           echo "GODOT=$PWD/godot_app/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
           "$PWD/godot_app/Godot.app/Contents/MacOS/Godot" --version
 
-      - name: Preparar o projeto de teste para exportar
-        run: |
-          set -euo pipefail
-          cp export_presets.cfg godot-cpp/test/project/export_presets.cfg
-          p=godot-cpp/test/project/project.godot
-          # nome sem espaco (o exportador de iOS exige) e GL Compatibility
-          if grep -q '^config/name=' "$p"; then sed -i '' 's|^config/name=.*|config/name="GdextProbe"|' "$p"; else sed -i '' 's|^\[application\]|[application]\
-          config/name="GdextProbe"|' "$p"; fi
-          grep -n 'config/name\|\[rendering\]\|etc2_astc' "$p" || true
-          printf '\n[rendering]\n\nrenderer/rendering_method="gl_compatibility"\nrenderer/rendering_method.mobile="gl_compatibility"\ntextures/vram_compression/import_etc2_astc=true\n' >> "$p"
-          cat godot-cpp/test/project/my_test.gdextension | grep -n 'ios\|dependencies' 
-
       - name: Importar o projeto
         run: |
-          "$GODOT" --headless --path godot-cpp/test/project --import 2>&1 | tee import.log || true
-          grep -i 'gdextension\|extension\|error' import.log | head -30 || true
+          "$GODOT" --headless --path probe_project --import 2>&1 | tee import.log || true
+          echo "--- extensao/erros no import"; grep -i 'gdextension\|extension\|ERROR' import.log | head -30 || true
+          ls -la probe_project
 
       - name: Exportar o projeto Xcode (iOS release) com a extensao
         run: |
           set -o pipefail
           mkdir -p build/ios
-          "$GODOT" --headless --path godot-cpp/test/project --export-release "iOS" "$PWD/build/ios/GdextProbe.ipa" 2>&1 | tee export.log
+          "$GODOT" --headless --path probe_project --export-release "iOS" "$PWD/build/ios/GdextProbe.ipa" 2>&1 | tee export.log
           ls -la build/ios
 
       - name: Compilar no Xcode sem assinar
@@ -105,21 +112,21 @@ jobs:
         run: |
           set -u
           {
-            echo "== frameworks / bibliotecas dentro do projeto exportado"
-            find build/ios -name '*mytest*' -maxdepth 4 | head -20
+            echo "== o que foi exportado para o projeto Xcode (nomes da extensao)"
+            find build/ios -iname '*${{ matrix.lib }}*' -o -iname '*godot-cpp*' | head -20
             echo "== referencias no .xcodeproj"
-            grep -c 'mytest' build/ios/GdextProbe.xcodeproj/project.pbxproj || true
-            grep 'mytest\|godot-cpp' build/ios/GdextProbe.xcodeproj/project.pbxproj | head -10 || true
+            grep -c '${{ matrix.lib }}\|godot-cpp' build/ios/GdextProbe.xcodeproj/project.pbxproj || true
+            grep '${{ matrix.lib }}\|godot-cpp' build/ios/GdextProbe.xcodeproj/project.pbxproj | head -10 || true
             app=$(find build/dd/Build/Products -maxdepth 2 -name '*.app' | head -1)
             echo "== app: $app"
             ls -la "$app" | head -40
-            echo "== frameworks no app"
+            echo "== frameworks/dylibs no app"
             find "$app" -name '*.framework' -o -name '*.dylib' | head -20
             bin=$(find "$app" -maxdepth 1 -type f -perm -u+x | head -1)
             echo "== binario: $bin ($(du -h "$bin" | cut -f1))"
-            echo "== simbolos da extensao no binario?"
-            strings "$bin" | grep -i 'my_test_library_init\|MyTestMain' | head -10
-            nm -gU "$bin" 2>/dev/null | grep -i 'my_test_library_init' | head -5
+            echo "== simbolos da extensao ligados no binario?"
+            strings "$bin" | grep -i '${{ matrix.entry }}' | head -10
+            nm -gU "$bin" 2>/dev/null | grep -i '${{ matrix.entry }}' | head -5
           } 2>&1 | tee inspect.log
 
       - name: Guardar resultados
