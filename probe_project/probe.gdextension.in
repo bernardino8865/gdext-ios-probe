@@ -1,0 +1,16 @@
+﻿[configuration]
+entry_symbol = "@ENTRY@"
+compatibility_minimum = "4.1"
+reloadable = false
+
+[libraries]
+ios.debug = "res://bin/@LIB@.ios.template_debug.xcframework"
+ios.release = "res://bin/@LIB@.ios.template_release.xcframework"
+
+[dependencies]
+ios.debug = {
+  "res://bin/libgodot-cpp.ios.template_debug.xcframework": ""
+}
+ios.release = {
+  "res://bin/libgodot-cpp.ios.template_release.xcframework": ""
+}
