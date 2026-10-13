@@ -1,0 +1,136 @@
+﻿name: GDExtension iOS probe
+
+# Prova (ou derruba) que uma GDExtension C++ (godot-cpp) empacotada em .xcframework exporta e compila para iOS com Godot 4.7.1.
+# Roda a cada push e pelo botao "Run workflow".
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  GODOT_RELEASE: 4.7.1-stable
+  GODOT_TEMPLATE_DIR: 4.7.1.stable
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rotulo: godot-cpp-4.5-stable
+            ref: e83fd0904c13356ed1d4c3d09f8bb9132bdc6b77
+          - rotulo: godot-cpp-10.0.0-stable
+            ref: 507ed9d840c01a3c5b2a39af8bb4000bfac30bf5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Obter o godot-cpp na versao FIXA
+        run: |
+          set -euo pipefail
+          git clone https://github.com/godotengine/godot-cpp.git godot-cpp
+          git -C godot-cpp checkout ${{ matrix.ref }}
+          git -C godot-cpp log -1 --format='godot-cpp em %H (%cd)'
+          ls godot-cpp/test godot-cpp/test/project
+
+      - name: Instalar SCons
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages scons || python3 -m pip install scons
+          scons --version
+
+      - name: Compilar C++ para iOS (simulador universal + aparelho arm64) e gerar .xcframework
+        working-directory: godot-cpp/test
+        run: |
+          set -o pipefail
+          for T in template_debug template_release; do
+            scons arch=universal ios_simulator=yes platform=ios target=$T 2>&1 | tail -n 15
+            scons arch=arm64 ios_simulator=no platform=ios target=$T 2>&1 | tail -n 15
+            ls -la project/bin ../bin || true
+            xcodebuild -create-xcframework -library ./project/bin/libmytest.ios.$T.a -library ./project/bin/libmytest.ios.$T.simulator.a -output ./project/bin/libmytest.ios.$T.xcframework
+            xcodebuild -create-xcframework -library ../bin/libgodot-cpp.ios.$T.arm64.a -library ../bin/libgodot-cpp.ios.$T.universal.simulator.a -output ./project/bin/libgodot-cpp.ios.$T.xcframework
+          done 2>&1 | tee ../../build_cpp.log
+          ls -la project/bin
+
+      - name: Instalar Godot 4.7.1 (padrao, sem mono) e os templates de export
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}"
+          curl -fL --retry 3 -o godot.zip "${base}/Godot_v${GODOT_RELEASE}_macos.universal.zip"
+          unzip -q godot.zip -d godot_app
+          curl -fL --retry 3 -o templates.tpz "${base}/Godot_v${GODOT_RELEASE}_export_templates.tpz"
+          unzip -q templates.tpz -d tpl
+          dest="$HOME/Library/Application Support/Godot/export_templates/${GODOT_TEMPLATE_DIR}"
+          mkdir -p "$dest"
+          mv tpl/templates/* "$dest/"
+          ls "$dest" | head -40
+          echo "GODOT=$PWD/godot_app/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+          "$PWD/godot_app/Godot.app/Contents/MacOS/Godot" --version
+
+      - name: Preparar o projeto de teste para exportar
+        run: |
+          set -euo pipefail
+          cp export_presets.cfg godot-cpp/test/project/export_presets.cfg
+          p=godot-cpp/test/project/project.godot
+          # nome sem espaco (o exportador de iOS exige) e GL Compatibility
+          if grep -q '^config/name=' "$p"; then sed -i '' 's|^config/name=.*|config/name="GdextProbe"|' "$p"; else sed -i '' 's|^\[application\]|[application]\
+          config/name="GdextProbe"|' "$p"; fi
+          grep -n 'config/name\|\[rendering\]\|etc2_astc' "$p" || true
+          printf '\n[rendering]\n\nrenderer/rendering_method="gl_compatibility"\nrenderer/rendering_method.mobile="gl_compatibility"\ntextures/vram_compression/import_etc2_astc=true\n' >> "$p"
+          cat godot-cpp/test/project/my_test.gdextension | grep -n 'ios\|dependencies' 
+
+      - name: Importar o projeto
+        run: |
+          "$GODOT" --headless --path godot-cpp/test/project --import 2>&1 | tee import.log || true
+          grep -i 'gdextension\|extension\|error' import.log | head -30 || true
+
+      - name: Exportar o projeto Xcode (iOS release) com a extensao
+        run: |
+          set -o pipefail
+          mkdir -p build/ios
+          "$GODOT" --headless --path godot-cpp/test/project --export-release "iOS" "$PWD/build/ios/GdextProbe.ipa" 2>&1 | tee export.log
+          ls -la build/ios
+
+      - name: Compilar no Xcode sem assinar
+        run: |
+          set -o pipefail
+          xcodebuild -project build/ios/GdextProbe.xcodeproj -scheme GdextProbe \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Inspecionar o pacote final (a extensao esta DENTRO do app?)
+        run: |
+          set -u
+          {
+            echo "== frameworks / bibliotecas dentro do projeto exportado"
+            find build/ios -name '*mytest*' -maxdepth 4 | head -20
+            echo "== referencias no .xcodeproj"
+            grep -c 'mytest' build/ios/GdextProbe.xcodeproj/project.pbxproj || true
+            grep 'mytest\|godot-cpp' build/ios/GdextProbe.xcodeproj/project.pbxproj | head -10 || true
+            app=$(find build/dd/Build/Products -maxdepth 2 -name '*.app' | head -1)
+            echo "== app: $app"
+            ls -la "$app" | head -40
+            echo "== frameworks no app"
+            find "$app" -name '*.framework' -o -name '*.dylib' | head -20
+            bin=$(find "$app" -maxdepth 1 -type f -perm -u+x | head -1)
+            echo "== binario: $bin ($(du -h "$bin" | cut -f1))"
+            echo "== simbolos da extensao no binario?"
+            strings "$bin" | grep -i 'my_test_library_init\|MyTestMain' | head -10
+            nm -gU "$bin" 2>/dev/null | grep -i 'my_test_library_init' | head -5
+          } 2>&1 | tee inspect.log
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.rotulo }}
+          if-no-files-found: warn
+          path: |
+            build_cpp.log
+            import.log
+            export.log
+            xcodebuild.log
+            inspect.log
